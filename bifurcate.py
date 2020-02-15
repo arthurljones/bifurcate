@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 
+#TODO: Subsample on x axis, and/or subpixel line size
+#TODO: Run bifurcate calculation in a thread
+
 import pygame, collections, math, numpy
 import pygame.surfarray as surfarray
 from pygame.locals import *
