@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 
 # TODO: Color pixels based on (normalized) iteration count before stabilization (if any)
-# TODO: X subsampling for columns (requires holding multiple columns in memory until done)
+# TODO: Further optimize calcNext (bulk of render time spent there at useful subsampling values)
 
 import pygame, collections, time
 import numpy as np
 import pygame.surfarray as surfarray
 from pygame.locals import *
+from math import ceil
 
 class Bifurcate: 
     def __init__(self):
@@ -16,112 +17,155 @@ class Bifurcate:
         self.height = 768
         self.screen = pygame.display.set_mode((self.width, self.height))
         self.clock = pygame.time.Clock()
-        self.startX = 2.0
-        self.endX = 4.0
+        self.startR = 2.0
+        self.endR = 4.0
+        self.currR = None
+        self.lastX = 0
+        self.subsample = 1.0
+        self.values = np.zeros((self.width, self.height))
 
         pygame.display.set_caption('bifurcate')
         background = pygame.Surface(self.screen.get_size())
         background = background.convert()
-        background.fill((16, 16, 16))
+        background.fill((0, 0, 0))
         self.screen.blit(background, (0, 0))
         pygame.display.flip()
 
-        self.surf = surfarray.pixels2d(self.screen)
-
-        self.columns = self.genColumns()
-
-    def drawColumn(self, x, column):
-        if x < 0 or x >= self.width:
-            return
-
-        colMax = np.max(column)
-        colMin = np.min(column)
-        range = colMax - colMin
-        #mean = np.mean(column)
-
-        normalizer = np.vectorize(lambda x: (x - colMin) / range * 0xFF)
-        normalized = normalizer([column])
-
-        iter = np.nditer(normalized)
-        y = 0
-        for val in iter:
-            if not np.isfinite(val):
-                continue
-            intVal = int(val)
-            color = intVal | intVal << 8 | intVal << 16
-            self.surf[x, self.height - y - 1] = color
-            y += 1
+        self.recalc()
 
     def domainWidth(self):
-        return self.endX - self.startX
+        return self.endR - self.startR
 
-    def genColumns(self, startY = 0.0, endY = 1.0):
-        subsampleY = 4.0
+    def currX(self):
+        if self.currR is None:
+            return self.width
+        else:
+            return (self.currR - self.startR) / self.domainWidth() * self.width
 
-        for r in np.arange(self.startX, self.endX, self.domainWidth() / self.width):
-            value = 0.5
+    def calcNext(self):
+        if self.currR is None:
+            return False
 
-            for n in range(100):
-                value = value * r * (1.0 - value)
+        rawX = self.currX()
+        x = int(rawX)
+        paramX = rawX - x
+        value = 0.5
 
-            lastVals = collections.deque(maxlen = 16)
-            column = np.zeros(self.height)
-            for i, n in enumerate(range(int(self.height * subsampleY))):
-                value = value * r * (1.0 - value)
+        for n in range(100):
+            value = value * self.currR * (1.0 - value)
 
-                # Paint on adjacent pixels
-                scaled = value * self.height
-                y = int(scaled)
-                param = scaled - y
-                if (y < len(column)):
-                    column[y] += 1 - param
-                if (y +1 < len(column)):
-                    column[y+1] += param
+        sampleStep = 1.0 / self.subsample
+        fill = None
+        # Erase ahead of where we'll be drawing if we've crossed into a new column
+        if rawX - sampleStep < x and x < self.width:
+            nextEnd = min(ceil(x + sampleStep), self.width - 1)
+            self.values[x:nextEnd].fill(0.0)
 
-                # Early exit for small-count columns
-                if i <= len(lastVals) + 1:
-                    done = False
-                    for lastVal in lastVals:
-                        if abs(lastVal - value) < 10e-8:
-                            done = True
-                            break
-                    if done:
+        lastVals = collections.deque(maxlen = 8)
+        for i, n in enumerate(range(int(self.height * self.subsample))):
+            value = value * self.currR * (1.0 - value)
+
+            # TODO: Draw over range for subsample < 1.0
+            # Split value between adjacent pixels
+            rawY = value * self.height
+            y = int(rawY)
+            paramY = rawY - y
+            if (x < self.width):
+                if (y < self.height):
+                    self.values[x][y] += (1 - paramY) * (1 - paramX)
+                if (y + 1 < self.height):
+                    self.values[x][y+1] += paramY * (1 - paramX)
+            if (x + 1 < self.width):
+                if (y < self.height):
+                    self.values[x+1][y] += (1 - paramY) * (paramX)
+                if (y + 1 < self.height):
+                    self.values[x+1][y+1] += paramY * (paramX)
+
+
+            # Early exit for small-count columns
+            if i <= len(lastVals) + 1:
+                done = False
+                for lastVal in lastVals:
+                    if abs(lastVal - value) < 10e-8:
+                        done = True
                         break
+                if done:
+                    break
 
-                    lastVals.append(value)
+                lastVals.append(value)
 
-            yield (r, column)
+        self.currR += self.domainWidth() / (self.width * self.subsample)
+        if self.currR > self.endR:
+            self.currR = None
+
+        return True
+
+    def recalc(self):
+        self.currR = self.startR
+        self.calcStart = time.time()
+
+        dim = f"{self.width}x{self.height}"
+        domain = f"[{round(self.startR, 4)}, {round(self.endR, 4)}]"
+        sub = f"{self.subsample}x"
+        print(f"Drawing {dim} in {domain} at {sub} subsampling")
+        
+    def draw(self):
+        pixels = np.zeros((self.width, self.height), dtype = int)
+        for x, column in enumerate(self.values):
+            norm = np.flip(((column - np.min(column)) / np.ptp(column) * 255)).astype(int)
+            pixels[x] = norm + np.left_shift(norm, 8) + np.left_shift(norm, 16)
+
+        cx = int(self.currX()) + 1
+        if cx < self.width:
+            pixels[cx].fill(0x007FFF7F)
+
+        pygame.surfarray.blit_array(self.screen, pixels)
+        pygame.display.flip()
 
     def tick(self):
-        start = pygame.time.get_ticks()
-        maxFrameTicks = (1000.0 / 60.0)
-        calcTime = 0.0
-        drawTime = 0.0
-        while self.columns and pygame.time.get_ticks() - start < maxFrameTicks:
-            calcStart = time.time()
-            result = next(self.columns, None)
-            if not result:
-                self.columns = None
+        lastTicks = self.clock.tick(30)
+        
+        maxFrameTime = 1.0 / 10.0
+        changed = False
+        finished = False
+        start = time.time()
+        while time.time() - start < maxFrameTime:
+            finished = not self.calcNext()
+            if finished:
                 break
+            else:
+                changed = True
 
-            r, column = result
-            x = (r - self.startX) / self.domainWidth() * self.width
-            calcTime += time.time() - calcStart
+        if changed:
+            if finished:
+                calcTime = time.time() - self.calcStart
+                print(f"Calculating... Done in {round(calcTime, 2)}s")
+            else:
+                percent = str(int(self.currX() * 100.0 / self.width)).rjust(3,' ')
+                print(f"Calculating... {percent}%\r", end = '')
 
-            drawStart = time.time()
-            self.drawColumn(int(x), column)
-            drawTime += time.time() - drawStart
+            self.draw()
 
-        if drawTime > 0.0:
-            print(f"calc/draw ratio: {calcTime / drawTime}")
 
-        self.clock.tick(60)
         for event in pygame.event.get():
-            if event.type == QUIT or (event.type == KEYDOWN and event.key == K_ESCAPE):
+            if event.type == QUIT:
                 return True
 
+            if event.type == KEYUP:
+                if event.key == K_ESCAPE or event.key == K_q or \
+                        (event.key == K_c and event.mod & KMOD_CTRL):
+                    return True
+
+                if event.key == K_UP:
+                    self.subsample *= 2.0
+                    self.recalc()
+
+                if event.key == K_DOWN:
+                    self.subsample /= 2.0
+                    self.recalc()
+
             elif event.type == MOUSEBUTTONUP:
-                rest = self.endX - self.startX
+                rest = self.endR - self.startR
                 
                 redraw = False
                 if event.button == 4:
@@ -132,16 +176,13 @@ class Bifurcate:
                     redraw = True
 
                 if redraw:
-                    self.startX = max(min(self.endX - rest, 4.0), -2.0)
-                    self.columns = self.genColumns()
-
-        pygame.display.flip()
+                    self.startR = max(min(self.endR - rest, 4.0), -2.0)
+                    self.recalc()
 
     def mainLoop(self):
         while True:
             if self.tick():
                 return
-
 
 if __name__ == "__main__":
     Bifurcate().mainLoop()
