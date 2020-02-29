@@ -2,54 +2,69 @@
 
 # TODO: Color pixels based on (normalized) iteration count before stabilization (if any)
 # TODO: Further optimize calcNext (bulk of render time spent there at useful subsampling values)
+# TODO: Bias zoom around current mouse position
+# TODO: screenToValue and valueToScreen methods
 
-import pygame, collections, time
+import collections, time
+import pygame as pg
 import numpy as np
-import pygame.surfarray as surfarray
 from pygame.locals import *
+from pygame import Rect
 from math import ceil
 
 class Bifurcate: 
     def __init__(self):
-        pygame.init()
+        pg.init()
 
         self.width = 1280
         self.height = 768
-        self.screen = pygame.display.set_mode((self.width, self.height))
-        self.clock = pygame.time.Clock()
+        self.screen = pg.display.set_mode((self.width, self.height))
+        self.clock = pg.time.Clock()
+        self.startI = 0.0
+        self.endI = 1.0
         self.startR = 2.0
         self.endR = 4.0
         self.currR = None
         self.lastX = 0
         self.subsample = 1.0
         self.values = np.zeros((self.width, self.height))
+        self.pixels = None
+        self.mouseDown = None
+        self.mouseDrag = None
+        self.done = False
 
-        pygame.display.set_caption('bifurcate')
-        background = pygame.Surface(self.screen.get_size())
+        pg.display.set_caption('bifurcate')
+        background = pg.Surface(self.screen.get_size())
         background = background.convert()
         background.fill((0, 0, 0))
         self.screen.blit(background, (0, 0))
-        pygame.display.flip()
+        pg.display.flip()
 
         self.recalc()
 
-    def domainWidth(self):
+    def domain(self):
         return self.endR - self.startR
+
+    def range(self):
+        return self.endI - self.startI
 
     def currX(self):
         if self.currR is None:
             return self.width
         else:
-            return (self.currR - self.startR) / self.domainWidth() * self.width
+            return (self.currR - self.startR) / self.domain() * self.width
 
     def calcNext(self):
         if self.currR is None:
             return False
 
         rawX = self.currX()
-        x = int(rawX)
-        paramX = rawX - x
+        x0 = int(rawX)
+        x1 = x0 + 1
+        px1 = rawX - x0
+        px0 = 1 - px1
         value = 0.5
+
 
         for n in range(100):
             value = value * self.currR * (1.0 - value)
@@ -57,44 +72,55 @@ class Bifurcate:
         sampleStep = 1.0 / self.subsample
         fill = None
         # Erase ahead of where we'll be drawing if we've crossed into a new column
-        if rawX - sampleStep < x and x < self.width:
-            nextEnd = min(ceil(x + sampleStep), self.width - 1)
-            self.values[x:nextEnd].fill(0.0)
+        if rawX - sampleStep < x0 and x0 < self.width:
+            nextEnd = min(ceil(x0 + sampleStep), self.width - 1)
+            self.values[x0:nextEnd].fill(0.0)
 
-        lastVals = collections.deque(maxlen = 8)
-        for i, n in enumerate(range(int(self.height * self.subsample))):
+        lastVals = collections.deque(maxlen = 32)
+        drawnCount = 0
+        for n in range(int(self.height * self.subsample)):
             value = value * self.currR * (1.0 - value)
 
             # TODO: Draw over range for subsample < 1.0
             # Split value between adjacent pixels
-            rawY = value * self.height
-            y = int(rawY)
-            paramY = rawY - y
-            if (x < self.width):
-                if (y < self.height):
-                    self.values[x][y] += (1 - paramY) * (1 - paramX)
-                if (y + 1 < self.height):
-                    self.values[x][y+1] += paramY * (1 - paramX)
-            if (x + 1 < self.width):
-                if (y < self.height):
-                    self.values[x+1][y] += (1 - paramY) * (paramX)
-                if (y + 1 < self.height):
-                    self.values[x+1][y+1] += paramY * (paramX)
+            rawY = (value - self.startI) / self.range() * self.height
+            y0 = int(rawY)
+            y1 = y0 + 1
+            py1 = rawY - y0
+            py0 = 1 - py1
 
+            drawn = False
+            if (x0 >= 0 and x0 < self.width):
+                if (y0 >= 0 and y0 < self.height):
+                    drawn = True
+                    self.values[x0][y0] += px0 * py0
+                if (y1 >= 0 and y1 < self.height):
+                    drawn = True
+                    self.values[x0][y1] += px0 * py1
+            if (x1 >= 0 and x1 < self.width):
+                if (y0 >= 0 and y0 < self.height):
+                    drawn = True
+                    self.values[x1][y0] += px1 * py0
+                if (y1 >= 0 and y1 < self.height):
+                    drawn = True
+                    self.values[x1][y1] += px1 * py1
 
-            # Early exit for small-count columns
-            if i <= len(lastVals) + 1:
-                done = False
-                for lastVal in lastVals:
-                    if abs(lastVal - value) < 10e-8:
-                        done = True
+            if drawn:
+                drawnCount += 1
+
+                # Early exit for small-count columns
+                if drawnCount <= len(lastVals) + 1:
+                    done = False
+                    for lastVal in lastVals:
+                        if abs(lastVal - value) < 10e-8:
+                            done = True
+                            break
+                    if done:
                         break
-                if done:
-                    break
 
-                lastVals.append(value)
+                    lastVals.append(value)
 
-        self.currR += self.domainWidth() / (self.width * self.subsample)
+        self.currR += self.domain() / (self.width * self.subsample)
         if self.currR > self.endR:
             self.currR = None
 
@@ -105,26 +131,121 @@ class Bifurcate:
         self.calcStart = time.time()
 
         dim = f"{self.width}x{self.height}"
-        domain = f"[{round(self.startR, 4)}, {round(self.endR, 4)}]"
+        domain = f"[{round(self.startR, 4)}, {round(self.endR, 4)}] ({self.domain()})"
+        range = f"[{round(self.startI, 4)}, {round(self.endI, 4)}] ({self.range()})"
         sub = f"{self.subsample}x"
-        print(f"Drawing {dim} in {domain} at {sub} subsampling")
+        print(f"Drawing {dim} in domain {domain}, range {range}  at {sub} subsampling")
         
-    def draw(self):
-        pixels = np.zeros((self.width, self.height), dtype = int)
-        for x, column in enumerate(self.values):
-            norm = np.flip(((column - np.min(column)) / np.ptp(column) * 255)).astype(int)
-            pixels[x] = norm + np.left_shift(norm, 8) + np.left_shift(norm, 16)
+    def draw(self, valuesChanged = False):
+        if self.pixels is None or valuesChanged:
+            self.pixels = np.zeros((self.width, self.height), dtype = int)
+            for x, column in enumerate(self.values):
+                norm = np.flip(((column - np.min(column)) / np.ptp(column) * 255)).astype(int)
+                self.pixels[x] = norm + np.left_shift(norm, 8) + np.left_shift(norm, 16)
 
-        cx = int(self.currX()) + 1
-        if cx < self.width:
-            pixels[cx].fill(0x007FFF7F)
+            cx = int(self.currX()) + 1
+            if cx < self.width:
+                self.pixels[cx].fill(0x007FFF7F)
 
-        pygame.surfarray.blit_array(self.screen, pixels)
-        pygame.display.flip()
+        pg.surfarray.blit_array(self.screen, self.pixels)
+
+        if self.mouseDrag:
+            pg.draw.rect(self.screen, (127, 127, 255), self.mouseDrag, 1)
+
+        pg.display.flip()
+
+    def mouseMove(self, pos):
+        if self.mouseDown:
+            dx, dy = self.mouseDown
+            cx, cy = pos
+            top = min(dy, cy)
+            left = min(dx, cx)
+            bottom = max(dy, cy)
+            right = max(dx, cx)
+            self.mouseDrag = Rect(left, top, right - left, bottom - top)
+            print(self.mouseDrag)
+        else:
+            self.mouseDrag = None
+
+    def boxZoom(self, rect):
+        if rect and rect.width > 1 and rect.height > 1:
+            startR = self.startR
+            startI = self.startI
+            domain = self.domain()
+            range = self.range()
+
+            self.startR = startR + float(rect.left) / self.width * domain
+            self.endR = startR + float(rect.right) / self.width * domain
+
+            self.startI = startI + (self.height - float(rect.bottom)) / self.height * range
+            self.endI = startI + (self.height - float(rect.top)) / self.height * range
+
+            self.clampViewport()
+            self.recalc()
+
+    def scaleZoom(self, scale):
+        domain = self.domain()
+        range = self.range()
+
+        halfScale = (1 - scale) / 2
+        self.startR += domain * halfScale
+        self.endR -= domain * halfScale
+        self.startI += range * halfScale
+        self.endI -= range * halfScale
+
+        self.clampViewport()
+        self.recalc()
+
+    def clampViewport(self):
+        quantum = 10e-9
+        self.startR = max(min(self.startR, 4.0 - quantum), 1.0)
+        self.endR = max(min(self.endR, 4.0), self.startR + quantum)
+        self.startI = max(min(self.startI, 1.0 - quantum), 0.0)
+        self.endI = max(min(self.endI, 1.0), self.startI + quantum)
+
+    def handleEvent(self, event):
+        if event.type == QUIT:
+            self.done = True
+
+        elif event.type == KEYUP:
+            if event.key == K_ESCAPE or event.key == K_q or \
+                    (event.key == K_c and event.mod & KMOD_CTRL):
+                self.done = True
+
+            if event.key == K_UP:
+                self.subsample *= 2.0
+                self.recalc()
+
+            if event.key == K_DOWN:
+                self.subsample /= 2.0
+                self.recalc()
+
+        elif event.type == pg.MOUSEMOTION:
+            self.mouseMove(event.pos)
+
+        elif event.type == MOUSEBUTTONDOWN:
+            self.mouseMove(event.pos)
+            if event.button == 1:
+                self.mouseDown = event.pos
+
+        elif event.type == MOUSEBUTTONUP:
+            self.mouseMove(event.pos)
+            rest = self.endR - self.startR
+            
+            recalc = False
+            if event.button == 1: # Left Click
+                if self.mouseDrag:
+                    self.boxZoom(self.mouseDrag)
+                self.mouseDown = None
+                self.mouseDrag = None
+
+            elif event.button == 4: # Scroll Down
+                self.scaleZoom(0.75)
+
+            elif event.button == 5: # Scroll Up
+                self.scaleZoom(1.33)
 
     def tick(self):
-        lastTicks = self.clock.tick(30)
-        
         maxFrameTime = 1.0 / 10.0
         changed = False
         finished = False
@@ -144,45 +265,15 @@ class Bifurcate:
                 percent = str(int(self.currX() * 100.0 / self.width)).rjust(3,' ')
                 print(f"Calculating... {percent}%\r", end = '')
 
-            self.draw()
+        for event in pg.event.get():
+            self.handleEvent(event)
 
-
-        for event in pygame.event.get():
-            if event.type == QUIT:
-                return True
-
-            if event.type == KEYUP:
-                if event.key == K_ESCAPE or event.key == K_q or \
-                        (event.key == K_c and event.mod & KMOD_CTRL):
-                    return True
-
-                if event.key == K_UP:
-                    self.subsample *= 2.0
-                    self.recalc()
-
-                if event.key == K_DOWN:
-                    self.subsample /= 2.0
-                    self.recalc()
-
-            elif event.type == MOUSEBUTTONUP:
-                rest = self.endR - self.startR
-                
-                redraw = False
-                if event.button == 4:
-                    rest *= 0.75
-                    redraw = True
-                elif event.button == 5:
-                    rest *= 1.33
-                    redraw = True
-
-                if redraw:
-                    self.startR = max(min(self.endR - rest, 4.0), -2.0)
-                    self.recalc()
+        self.draw(changed)
+        lastTicks = self.clock.tick(30)
 
     def mainLoop(self):
-        while True:
-            if self.tick():
-                return
+        while not self.done:
+            self.tick()
 
 if __name__ == "__main__":
     Bifurcate().mainLoop()
